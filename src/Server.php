@@ -341,8 +341,6 @@ abstract class Server
 
         $this->response->setContentType('application/json', 'UTF-8');
         $this->response->setCode(IResponse::S204_NO_CONTENT);
-//        header('Content-type: application/json; charset=UTF-8');
-//        http_response_code(204);
     }
 
     /**
