@@ -1,9 +1,14 @@
 <?php
+
 namespace K7\SSO;
 
-use Desarrolla2\Cache\Cache;
-use Desarrolla2\Cache\Adapter;
-use Jasny\ValidationResult;
+use Nette\Caching\Cache;
+use Nette\Caching\IStorage;
+use Nette\Caching\Storages\FileStorage;
+use Nette\Http\IRequest;
+use Nette\Http\IResponse;
+use Nette\Http\Session;
+use Nette\Http\Url;
 
 /**
  * Single sign-on server.
@@ -18,7 +23,10 @@ abstract class Server
     /**
      * @var array
      */
-    protected $options = ['files_cache_directory' => '/tmp', 'files_cache_ttl' => 36000];
+    protected $options = [
+        'files_cache_directory' => '/tmp',
+        'files_cache_ttl' => 36000
+    ];
 
     /**
      * Cache that stores the special session data for the brokers.
@@ -26,44 +34,51 @@ abstract class Server
      * @var Cache
      */
     protected $cache;
-
-    /**
-     * @var string
-     */
+    /** @var string */
     protected $returnType;
-
-    /**
-     * @var mixed
-     */
+    /** @var mixed */
     protected $brokerId;
-
+    /** @var IStorage */
+    private $storage;
+    /** @var int|mixed */
+    private $ttl = 36000;
+    /** @var IResponse */
+    private $response;
+    /** @var IRequest */
+    private $request;
+    /** @var Session */
+    private $session;
 
     /**
      * Class constructor
      *
      * @param array $options
+     * @param IResponse $response
+     * @param IRequest $request
+     * @param Session $session
      */
-    public function __construct(array $options = [])
-    {
+    public function __construct(
+        array $options = [],
+        IResponse $response,
+        IRequest $request,
+        Session $session
+    ) {
+        $this->response = $response;
+        $this->request = $request;
         $this->options = $options + $this->options;
-        $this->cache = $this->createCacheAdapter();
+//        $this->storage = new SQLiteStorage();
+        // TODO: Cache to interface?
+        $this->storage = new FileStorage($this->options['files_cache_directory']);
+        $this->cache = new Cache($this->storage);
+        $this->ttl = $this->options['files_cache_ttl'];
+        $this->session = $session;
+        $this->session->close();
     }
 
-    /**
-     * Create a cache to store the broker session id.
-     *
-     * @return Cache
-     */
-    protected function createCacheAdapter()
-    {
-        $adapter = new Adapter\File($this->options['files_cache_directory']);
-        $adapter->setOption('ttl', $this->options['files_cache_ttl']);
-
-        return new Cache($adapter);
-    }
 
     /**
      * Start the session for broker requests to the SSO server
+     * @throws Exception
      */
     public function startBrokerSession()
     {
@@ -72,17 +87,19 @@ abstract class Server
         $sid = $this->getBrokerSessionID();
 
         if ($sid === false) {
-            return $this->fail("Broker didn't send a session key", 400);
+            $this->fail("Broker didn't send a session key", IResponse::S400_BAD_REQUEST);
+            return;
         }
 
-        $linkedId = $this->cache->get($sid);
+        $linkedId = $this->cache->load($sid);
 
         if (!$linkedId) {
-            return $this->fail("The broker session id isn't attached to a user session", 403);
+            $this->fail("The broker session id isn't attached to a user session", IResponse::S403_FORBIDDEN);
+            return;
         }
 
         if (session_status() === PHP_SESSION_ACTIVE) {
-            if ($linkedId !== session_id()) throw new \Exception("Session has already started", 400);
+            if ($linkedId !== session_id()) throw new Exception("Session has already started", IResponse::S400_BAD_REQUEST);
             return;
         }
 
@@ -92,35 +109,42 @@ abstract class Server
         $this->brokerId = $this->validateBrokerSessionId($sid);
     }
 
-            /**
-         * Get session ID from header Authorization or from $_GET/$_POST
-         */
-        protected function getBrokerSessionID()
-        {
-            $headers = getallheaders();
+    /**
+     * Get session ID from header Authorization or from GET/POST
+     */
+    protected function getBrokerSessionID()
+    {
+        $authorizationHeader = $this->request->getHeader('Authorization');
+        $accessTokenGetParam = $this->request->getQuery('access_token');
+        $ssoSessionGetParam = $this->request->getQuery('sso_session');
+        $accessTokenPostParam = $this->request->getPost('access_token');
 
-            if (isset($headers['Authorization']) &&  strpos($headers['Authorization'], 'Bearer') === 0) {
-                $headers['Authorization'] = substr($headers['Authorization'], 7);
-                return $headers['Authorization'];
-            }
-            if (isset($_GET['access_token'])) {
-                return $_GET['access_token'];
-            }
-            if (isset($_POST['access_token'])) {
-                return $_POST['access_token'];
-            }
-            if (isset($_GET['sso_session'])) {
-                return $_GET['sso_session'];
-            }
-
-            return false;
+        if ($authorizationHeader && strpos($authorizationHeader, 'Bearer') === 0) {
+            $authorizationHeader = substr($authorizationHeader, 7);
+            return $authorizationHeader;
         }
+
+        if ($accessTokenGetParam) {
+            return $accessTokenGetParam;
+        }
+
+        if ($ssoSessionGetParam) {
+            return $ssoSessionGetParam;
+        }
+
+        if ($accessTokenPostParam) {
+            return $accessTokenPostParam;
+        }
+
+        return false;
+    }
 
     /**
      * Validate the broker session id
      *
      * @param string $sid session id
      * @return string  the broker id
+     * @throws Exception
      */
     protected function validateBrokerSessionId($sid)
     {
@@ -187,39 +211,54 @@ abstract class Server
      */
     protected function detectReturnType()
     {
-        if (!empty($_GET['return_url'])) {
+        $returnUrl = $this->request->getQuery('return_url');
+        $callback = $this->request->getQuery('callback');
+        $accept = $this->request->getHeader('Accept');
+
+        if ($returnUrl) {
             $this->returnType = 'redirect';
-        } elseif (!empty($_GET['callback'])) {
+        } elseif ($callback) {
             $this->returnType = 'jsonp';
-        } elseif (strpos($_SERVER['HTTP_ACCEPT'], 'image/') !== false) {
+        } elseif (strpos($accept, 'image/') !== false) {
             $this->returnType = 'image';
-        } elseif (strpos($_SERVER['HTTP_ACCEPT'], 'application/json') !== false) {
+        } elseif (strpos($accept, 'application/json') !== false) {
             $this->returnType = 'json';
         }
     }
 
     /**
      * Attach a user session to a broker session
+     * @throws Exception
      */
     public function attach()
     {
         $this->detectReturnType();
 
-        if (empty($_REQUEST['broker'])) return $this->fail("No broker specified", 400);
-        if (empty($_REQUEST['token'])) return $this->fail("No token specified", 400);
+        $brokerParam = $this->request->getQuery('broker');
+        $tokenParam = $this->request->getQuery('token');
+        $checksumParam = $this->request->getQuery('checksum');
 
-        if (!$this->returnType) return $this->fail("No return url specified", 400);
+        if (!$brokerParam) {
+            return $this->fail("No broker specified", IResponse::S400_BAD_REQUEST);
+        }
+        if (!$tokenParam) {
+            return $this->fail("No token specified", IResponse::S400_BAD_REQUEST);
+        }
 
-        $checksum = $this->generateAttachChecksum($_REQUEST['broker'], $_REQUEST['token']);
+        if (!$this->returnType) {
+            return $this->fail("No return url specified", IResponse::S400_BAD_REQUEST);
+        }
 
-        if (empty($_REQUEST['checksum']) || $checksum != $_REQUEST['checksum']) {
-            return $this->fail("Invalid checksum", 400);
+        $checksum = $this->generateAttachChecksum($brokerParam, $tokenParam);
+
+        if (!$checksumParam || $checksum != $checksumParam) {
+            return $this->fail("Invalid checksum", IResponse::S400_BAD_REQUEST);
         }
 
         $this->startUserSession();
-        $sid = $this->generateSessionId($_REQUEST['broker'], $_REQUEST['token']);
+        $sid = $this->generateSessionId($brokerParam, $tokenParam);
 
-        $this->cache->set($sid, $this->getSessionData('id'));
+        $this->cache->save($sid, $this->getSessionData('id'), [Cache::EXPIRATION => $this->ttl]);
         $this->outputAttachSuccess();
     }
 
@@ -239,13 +278,13 @@ abstract class Server
 
         if ($this->returnType === 'jsonp') {
             $data = json_encode(['success' => 'attached']);
-            echo $_REQUEST['callback'] . "($data, 200);";
+            $qCallback = $this->request->getQuery('callback');
+            echo $qCallback . "($data, 200);";
         }
 
         if ($this->returnType === 'redirect') {
-            $url = $_REQUEST['return_url'];
-            header("Location: $url", true, 307);
-            echo "You're being redirected to <a href='{$url}'>$url</a>";
+            $url = $this->request->getQuery('return_url');
+            $this->response->redirect($url, IResponse::S307_TEMPORARY_REDIRECT);
         }
     }
 
@@ -254,50 +293,61 @@ abstract class Server
      */
     protected function outputImage()
     {
-        header('Content-Type: image/png');
+        $this->response->setContentType('image/png');
         echo base64_decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQ'
             . 'MAAAAl21bKAAAAA1BMVEUAAACnej3aAAAAAXRSTlMAQObYZg'
             . 'AAAApJREFUCNdjYAAAAAIAAeIhvDMAAAAASUVORK5CYII=');
     }
 
-
     /**
      * Authenticate
+     *
+     * @throws Exception
      */
     public function login()
     {
         $this->startBrokerSession();
 
-        if (empty($_POST['username'])) $this->fail("No username specified", 400);
-        if (empty($_POST['password'])) $this->fail("No password specified", 400);
+        $qUsername = $this->request->getPost('username');
+        $qPassword = $this->request->getPost('password');
 
-        $validation = json_decode($this->authenticate($_POST['username'], $_POST['password']));
-
-        if (isset($validation['errors'])) {
-            return $this->fail($validation['errors'], 400);
+        if (empty($qUsername)) {
+            $this->fail("No username specified", IResponse::S400_BAD_REQUEST);
         }
-//        if ($validation->failed()) {
-//            return $this->fail($validation->getError(), 400);
-//        }
 
-        $this->setSessionData('sso_user', $_POST['username']);
+        if (empty($qPassword)) {
+            $this->fail("No password specified", IResponse::S400_BAD_REQUEST);
+        }
+
+        $validation = json_decode($this->authenticate($qUsername, $qPassword));
+
+        if (isset($validation->errors)) {
+            $this->fail($validation->errors, IResponse::S400_BAD_REQUEST);
+            return;
+        }
+
+        $this->setSessionData('sso_user', $qUsername);
         $this->userInfo();
     }
 
     /**
      * Log out
+     * @throws Exception
      */
     public function logout()
     {
         $this->startBrokerSession();
         $this->setSessionData('sso_user', null);
 
-        header('Content-type: application/json; charset=UTF-8');
-        http_response_code(204);
+        $this->response->setContentType('application/json', 'UTF-8');
+        $this->response->setCode(IResponse::S204_NO_CONTENT);
+//        header('Content-type: application/json; charset=UTF-8');
+//        http_response_code(204);
     }
 
     /**
-     * Ouput user information as json.
+     * Output user information as json.
+     * @throws Exception
      */
     public function userInfo()
     {
@@ -308,10 +358,10 @@ abstract class Server
 
         if ($username) {
             $user = $this->getUserInfo($username);
-            if (!$user) return $this->fail("User not found", 500); // Shouldn't happen
+            if (!$user) return $this->fail("User not found", IResponse::S500_INTERNAL_SERVER_ERROR); // Shouldn't happen
         }
 
-        header('Content-type: application/json; charset=UTF-8');
+        $this->response->setContentType('application/json','UTF-8');
         echo json_encode($user);
     }
 
@@ -335,7 +385,8 @@ abstract class Server
     /**
      * Get session data
      *
-     * @param type $key
+     * @param $key
+     * @return null|string
      */
     protected function getSessionData($key)
     {
@@ -348,32 +399,33 @@ abstract class Server
     /**
      * An error occured.
      *
-     * @param string $message
-     * @param int    $http_status
+     * @param $message
+     * @param int $http_status
+     * @throws Exception
      */
-    protected function fail($message, $http_status = 500)
+    protected function fail($message, $http_status = IResponse::S500_INTERNAL_SERVER_ERROR)
     {
         if (!empty($this->options['fail_exception'])) {
             throw new Exception($message, $http_status);
         }
 
-        if ($http_status === 500) trigger_error($message, E_USER_WARNING);
+        if ($http_status === IResponse::S500_INTERNAL_SERVER_ERROR) trigger_error($message, E_USER_WARNING);
 
         if ($this->returnType === 'jsonp') {
-            echo $_REQUEST['callback'] . "(" . json_encode(['error' => $message]) . ", $http_status);";
+            $qCallback = $this->request->getQuery('callback');
+            echo $qCallback . "(" . json_encode(['error' => $message]) . ", $http_status);";
             exit();
         }
 
         if ($this->returnType === 'redirect') {
-            $url = $_REQUEST['return_url'] . '?sso_error=' . $message;
-            header("Location: $url", true, 307);
-            echo "You're being redirected to <a href='{$url}'>$url</a>";
+            $url = new Url($this->request->getQuery('return_url'));
+            $url->setQueryParameter('sso_error', $message);
+            $this->response->redirect($url, IResponse::S307_TEMPORARY_REDIRECT);
             exit();
         }
 
-        http_response_code($http_status);
-        header('Content-type: application/json; charset=UTF-8');
-
+        $this->response->setCode($http_status);
+        $this->response->setContentType('application/json', 'UTF-8');
         echo json_encode(['error' => $message]);
         exit();
     }
@@ -384,7 +436,7 @@ abstract class Server
      *
      * @param string $username
      * @param string $password
-     * @return \Jasny\ValidationResult
+     * @return array
      */
     abstract protected function authenticate($username, $password);
 
