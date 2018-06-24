@@ -11,7 +11,7 @@ class SSOResponse
 
 
     /** @var array */
-    private $data = [];
+    private $data;
 
     /** @var string */
     private $error;
@@ -19,9 +19,11 @@ class SSOResponse
     /** @var string */
     private $success;
 
-    public function __construct(array $data = [], $error = null, $success = null)
+    public function __construct($data = null, $error = null, $success = null)
     {
-        $this->data = $data;
+        if ($data) {
+            $this->data = $data;
+        }
         $this->error = $error;
         $this->setSuccess($success);
     }
@@ -45,8 +47,12 @@ class SSOResponse
     /**
      * @param mixed $data
      */
-    public function addData($data)
+    public function setData($data)
     {
+        if (!$data) {
+            $this->data = [];
+        }
+
         $this->data[] = $data;
     }
 
@@ -107,9 +113,10 @@ class SSOResponse
      */
     public function __toString()
     {
-        $result = [
-            'data' => $this->data,
-        ];
+        $result = [];
+        if (isset($this->data)) {
+            $result['data'] = $this->data;
+        }
 
         if ($this->hasError()) {
             $result['error'] = $this->error;
