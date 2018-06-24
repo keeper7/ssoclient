@@ -158,7 +158,7 @@ abstract class Server
         $token = $matches[2];
 
         if ($this->generateSessionId($brokerId, $token) != $sid) {
-            return $this->fail("Checksum failed: Client IP address may have changed", 403);
+            return $this->fail("Checksum failed: Client IP address may have changed", IResponse::S403_FORBIDDEN);
         }
 
         return $brokerId;
@@ -273,11 +273,11 @@ abstract class Server
 
         if ($this->returnType === 'json') {
             header('Content-type: application/json; charset=UTF-8');
-            echo json_encode(['success' => 'attached']);
+            echo new SSOResponse([], [], 'attached');
         }
 
         if ($this->returnType === 'jsonp') {
-            $data = json_encode(['success' => 'attached']);
+            $data = (string) new SSOResponse([], [], 'attached');
             $qCallback = $this->request->getQuery('callback');
             echo $qCallback . "($data, 200);";
         }
@@ -319,10 +319,12 @@ abstract class Server
             $this->fail("No password specified", IResponse::S400_BAD_REQUEST);
         }
 
-        $validation = json_decode($this->authenticate($qUsername, $qPassword));
 
-        if (isset($validation->errors)) {
-            $this->fail($validation->errors, IResponse::S400_BAD_REQUEST);
+        /** @var SSOResponse $validation */
+        $validation = $this->authenticate($qUsername, $qPassword);
+
+        if ($validation->hasError()) {
+            $this->fail($validation->getError(), IResponse::S400_BAD_REQUEST);
             return;
         }
 
@@ -356,11 +358,16 @@ abstract class Server
 
         if ($username) {
             $user = $this->getUserInfo($username);
-            if (!$user) return $this->fail("User not found", IResponse::S500_INTERNAL_SERVER_ERROR); // Shouldn't happen
+
+            if (!$user) {
+                $this->startBrokerSession();
+                $this->setSessionData('sso_user', null);
+                return $this->fail("User not found", IResponse::S403_FORBIDDEN);
+            } // Shouldn't happen
         }
 
         $this->response->setContentType('application/json','UTF-8');
-        echo json_encode($user);
+        echo new SSOResponse($user);
     }
 
 
@@ -411,7 +418,9 @@ abstract class Server
 
         if ($this->returnType === 'jsonp') {
             $qCallback = $this->request->getQuery('callback');
-            echo $qCallback . "(" . json_encode(['error' => $message]) . ", $http_status);";
+            $data = json_encode(['error' => $message]);
+            $data = (string) new SSOResponse([], $message);
+            echo $qCallback . "(" . $data . ", $http_status);";
             exit();
         }
 
@@ -424,7 +433,7 @@ abstract class Server
 
         $this->response->setCode($http_status);
         $this->response->setContentType('application/json', 'UTF-8');
-        echo json_encode(['error' => $message]);
+        echo new SSOResponse([], $message);
         exit();
     }
 
@@ -434,7 +443,7 @@ abstract class Server
      *
      * @param string $username
      * @param string $password
-     * @return array
+     * @return SSOResponse
      */
     abstract protected function authenticate($username, $password);
 
