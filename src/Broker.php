@@ -307,7 +307,8 @@ class Broker
     public function getUserInfo()
     {
         if (!isset($this->userinfo)) {
-            $this->userinfo = $this->request('GET', 'userInfo');
+            $request = $this->request('GET', 'userInfo');
+            $this->userinfo = empty($request) ? null: $request;
         }
 
         return $this->userinfo;
